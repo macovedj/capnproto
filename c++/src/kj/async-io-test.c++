@@ -1583,6 +1583,295 @@ KJ_TEST("Userland pipe cancel write") {
   KJ_EXPECT(pipe.in->readAllText().wait(ws) == "");
 }
 
+template <typename Func>
+void expectPipeWriteAbort(Func&& func) {
+  KJ_IF_SOME(exception, kj::runCatchingExceptions(kj::fwd<Func>(func))) {
+    KJ_EXPECT(exception.getType() == kj::Exception::Type::FAILED);
+    KJ_EXPECT(exception.getDescription() == "upload source failed");
+  } else {
+    KJ_FAIL_EXPECT("expected the original upload failure");
+  }
+}
+
+template <typename T>
+void expectPipeWriteAbort(kj::Promise<T> promise, WaitScope& ws) {
+  KJ_ASSERT(promise.poll(ws));
+  expectPipeWriteAbort([&]() { promise.wait(ws); });
+}
+
+KJ_TEST("Userland pipe abortWrite rejects a pending read") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newOneWayPipe();
+  char buffer[8];
+  auto read = pipe.in->tryRead(buffer, 1, sizeof(buffer));
+  KJ_EXPECT(!read.poll(ws));
+  auto disconnected = pipe.out->whenWriteDisconnected();
+  KJ_EXPECT(!disconnected.poll(ws));
+
+  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  disconnected.wait(ws);
+  pipe.out = nullptr;
+
+  expectPipeWriteAbort(kj::mv(read), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite preserves its first reason for future reads and pumps") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newOneWayPipe();
+  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  pipe.out->abortWrite(KJ_EXCEPTION(DISCONNECTED, "a later failure"));
+  pipe.out = nullptr;
+
+  byte buffer[8];
+  expectPipeWriteAbort(pipe.in->tryRead(buffer, 1, sizeof(buffer)), ws);
+  expectPipeWriteAbort([&]() { auto result KJ_UNUSED = pipe.in->tryReadSync(buffer, 1); });
+  auto destination = newOneWayPipe();
+  expectPipeWriteAbort(pipe.in->pumpTo(*destination.out), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite rejects a pump waiting for more bytes") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newOneWayPipe();
+  auto destination = newOneWayPipe();
+  auto pump = pipe.in->pumpTo(*destination.out);
+
+  auto write = pipe.out->write("foo"_kjb);
+  expectRead(*destination.in, "foo").wait(ws);
+  write.wait(ws);
+  KJ_EXPECT(!pump.poll(ws));
+
+  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  pipe.out = nullptr;
+
+  expectPipeWriteAbort(kj::mv(pump), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite cancels a pump blocked on its output") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newOneWayPipe();
+  auto destination = newOneWayPipe();
+  auto pump = pipe.in->pumpTo(*destination.out);
+  auto write = pipe.out->write("foo"_kjb);
+  KJ_EXPECT(!write.poll(ws));
+  KJ_EXPECT(!pump.poll(ws));
+
+  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  expectPipeWriteAbort(kj::mv(write), ws);
+  expectPipeWriteAbort(kj::mv(pump), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite preserves its reason for pending and future writes") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  ArrayPtr<const byte> pieces[] = { "foo"_kjb, "bar"_kjb };
+
+  for (bool gather: {false, true}) {
+    KJ_CONTEXT(gather);
+    auto pipe = newOneWayPipe();
+    auto write = gather ? pipe.out->write(pieces) : pipe.out->write("foo"_kjb);
+    KJ_EXPECT(!write.poll(ws));
+
+    pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    expectPipeWriteAbort(kj::mv(write), ws);
+    expectPipeWriteAbort(pipe.out->write("bar"_kjb), ws);
+    expectPipeWriteAbort(pipe.out->write(pieces), ws);
+    expectPipeWriteAbort([&]() { pipe.out->tryWriteSync("baz"_kjb); });
+    expectPipeWriteAbort([&]() { pipe.out->tryWriteSync(pieces); });
+  }
+}
+
+KJ_TEST("Userland pipe abortWrite rejects an adopted pump without waiting for input") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto source = newOneWayPipe();
+  auto destination = newOneWayPipe();
+  auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
+  KJ_EXPECT(!pump.poll(ws));
+
+  destination.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  // A read-side abort probes for EOF here. An explicit write abort must reject immediately,
+  // even if the source is idle and might never produce another byte.
+  KJ_ASSERT(pump.poll(ws));
+  expectPipeWriteAbort(kj::mv(pump), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite cancels an adopted pump with an input read in flight") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto source = newOneWayPipe();
+  auto destination = newOneWayPipe();
+  auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
+  char buffer;
+  auto read = destination.in->tryRead(&buffer, 1, 1);
+  KJ_EXPECT(!read.poll(ws));
+  KJ_EXPECT(!pump.poll(ws));
+
+  destination.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  KJ_ASSERT(pump.poll(ws));
+  KJ_ASSERT(read.poll(ws));
+  expectPipeWriteAbort(kj::mv(pump), ws);
+  expectPipeWriteAbort(kj::mv(read), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite rejects a future adopted pump even at EOF") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  for (bool eof: {false, true}) {
+    KJ_CONTEXT(eof);
+    auto source = newOneWayPipe();
+    if (eof) source.out = nullptr;
+    auto destination = newOneWayPipe();
+    destination.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+
+    auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
+    KJ_ASSERT(pump.poll(ws));
+    expectPipeWriteAbort(kj::mv(pump), ws);
+  }
+}
+
+KJ_TEST("Userland pipe read abort still allows adopted pumps whose input reaches EOF") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  for (bool abortBeforePump: {false, true}) {
+    KJ_CONTEXT(abortBeforePump);
+    auto source = newOneWayPipe();
+    auto destination = newOneWayPipe();
+    if (abortBeforePump) destination.in = nullptr;
+
+    auto pump = KJ_ASSERT_NONNULL(destination.out->tryPumpFrom(*source.in));
+    KJ_EXPECT(!pump.poll(ws));
+    if (!abortBeforePump) destination.in = nullptr;
+    KJ_EXPECT(!pump.poll(ws));
+    source.out = nullptr;
+    KJ_EXPECT(pump.wait(ws) == 0);
+  }
+}
+
+KJ_TEST("Userland pipe abortWrite preserves zero-length operations") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newOneWayPipe();
+  auto other = newOneWayPipe();
+  pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+
+  byte buffer;
+  KJ_EXPECT(pipe.in->tryRead(&buffer, 0, 1).wait(ws) == 0);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(pipe.in->tryReadSync(arrayPtr(&buffer, 1), 0)) == 0);
+  KJ_EXPECT(pipe.in->pumpTo(*other.out, 0).wait(ws) == 0);
+  auto pump = KJ_ASSERT_NONNULL(pipe.out->tryPumpFrom(*other.in, 0));
+  KJ_EXPECT(pump.wait(ws) == 0);
+
+  ArrayPtr<const byte> pieces[] = { ""_kjb, ""_kjb };
+  pipe.out->write(""_kjb).wait(ws);
+  pipe.out->write(pieces).wait(ws);
+  KJ_EXPECT(pipe.out->tryWriteSync(""_kjb));
+  KJ_EXPECT(pipe.out->tryWriteSync(pieces));
+}
+
+KJ_TEST("Userland two-way pipe abortWrite leaves the reverse direction usable") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newTwoWayPipe();
+  char buffer[8];
+  auto read = pipe.ends[1]->tryRead(buffer, 1, sizeof(buffer));
+  KJ_EXPECT(!read.poll(ws));
+
+  pipe.ends[0]->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+  expectPipeWriteAbort(kj::mv(read), ws);
+  expectPipeWriteAbort(pipe.ends[0]->write("foo"_kjb), ws);
+
+  auto write = pipe.ends[1]->write("bar"_kjb);
+  expectRead(*pipe.ends[0], "bar").wait(ws);
+  write.wait(ws);
+}
+
+KJ_TEST("Userland capability pipe abortWrite rejects pending capability reads") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  for (bool fds: {false, true}) {
+    KJ_CONTEXT(fds);
+    auto pipe = newCapabilityPipe();
+    char buffer[8];
+    auto read = fds ? pipe.ends[1]->tryReadWithFds(buffer, 1, sizeof(buffer), nullptr, 0)
+        : pipe.ends[1]->tryReadWithStreams(buffer, 1, sizeof(buffer), nullptr, 0);
+    KJ_EXPECT(!read.poll(ws));
+
+    pipe.ends[0]->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    expectPipeWriteAbort(kj::mv(read), ws);
+  }
+}
+
+KJ_TEST("Userland capability pipe abortWrite preserves its reason for future operations") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+  auto pipe = newCapabilityPipe();
+  pipe.ends[0]->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+
+  char buffer[8];
+  expectPipeWriteAbort(pipe.ends[1]->tryReadWithFds(buffer, 1, sizeof(buffer), nullptr, 0), ws);
+  expectPipeWriteAbort(pipe.ends[1]->tryReadWithStreams(buffer, 1, sizeof(buffer), nullptr, 0), ws);
+  expectPipeWriteAbort(pipe.ends[0]->writeWithFds("foo"_kjb, nullptr, ArrayPtr<const int>()), ws);
+  expectPipeWriteAbort(pipe.ends[0]->writeWithStreams("foo"_kjb, nullptr, nullptr), ws);
+}
+
+KJ_TEST("Userland pipe abortWrite does not replace an earlier terminal state") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  {
+    auto pipe = newTwoWayPipe();
+    pipe.ends[1]->abortRead();
+    pipe.ends[0]->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+      pipe.ends[0]->write("foo"_kjb).wait(ws);
+    })) {
+      KJ_EXPECT(exception.getType() == kj::Exception::Type::DISCONNECTED);
+      KJ_EXPECT(exception.getDescription() == "abortRead() has been called");
+    } else {
+      KJ_FAIL_EXPECT("expected the earlier read abort");
+    }
+  }
+
+  {
+    auto pipe = newTwoWayPipe();
+    pipe.ends[0]->shutdownWrite();
+    pipe.ends[0]->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    // A clean shutdown that already happened cannot be turned into a failed upload later.
+    KJ_EXPECT(pipe.ends[1]->readAllText().wait(ws) == "");
+  }
+}
+
+KJ_TEST("Userland pipe with limit reports aborts only before reaching the limit") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  for (bool complete: {false, true}) {
+    KJ_CONTEXT(complete);
+    auto pipe = newOneWayPipe(3);
+    auto bytes = complete ? "foo"_kjb : "f"_kjb;
+    auto write = pipe.out->write(bytes);
+    expectRead(*pipe.in, complete ? "foo" : "f").wait(ws);
+    write.wait(ws);
+    pipe.out->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    pipe.out = nullptr;
+
+    if (complete) {
+      // Consuming the declared length completes the input, regardless of later writer activity.
+      KJ_EXPECT(pipe.in->readAllText().wait(ws) == "");
+    } else {
+      char buffer;
+      expectPipeWriteAbort(pipe.in->tryRead(&buffer, 1, 1), ws);
+    }
+  }
+}
+
 KJ_TEST("Userland pipe cancel read") {
   kj::EventLoop loop;
   WaitScope ws(loop);
