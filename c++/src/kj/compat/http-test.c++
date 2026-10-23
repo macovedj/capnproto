@@ -1280,6 +1280,286 @@ KJ_TEST("HttpClient chunked body gather-write") {
                     "b\r\nfoo bar baz\r\n0\r\n\r\n", text);
 }
 
+KJ_TEST("HttpClient aborted chunked body does not send a terminating chunk") {
+  KJ_HTTP_TEST_SETUP_IO;
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+  auto serverPromise = pipe.ends[1]->readAllText();
+
+  {
+    HttpHeaderTable table;
+    auto client = newHttpClient(table, *pipe.ends[0]);
+    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table));
+    req.body->write("partial"_kjb).wait(waitScope);
+    req.body->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    // Repeated aborts must not finish the body either.
+    req.body->abortWrite(KJ_EXCEPTION(FAILED, "another failure"));
+    req.body = nullptr;
+
+    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
+        client->request(HttpMethod::GET, "/", HttpHeaders(table)));
+  }
+
+  pipe.ends[0]->shutdownWrite();
+  auto text = serverPromise.wait(waitScope);
+  KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    "7\r\npartial\r\n", text);
+}
+
+KJ_TEST("HttpService adapter aborts a chunked body when its source fails") {
+  KJ_HTTP_TEST_SETUP_IO;
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+  auto serverPromise = pipe.ends[1]->readAllText();
+
+  {
+    HttpHeaderTable table;
+    auto nativeClient = newHttpClient(table, *pipe.ends[0]);
+    auto service = newHttpService(*nativeClient);
+    auto client = newHttpClient(*service);
+    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table));
+    req.body->write("partial"_kjb).wait(waitScope);
+    req.body->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    req.body = nullptr;
+
+    KJ_EXPECT_THROW_MESSAGE("upload source failed", req.response.wait(waitScope));
+    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
+        nativeClient->request(HttpMethod::GET, "/", HttpHeaders(table)));
+    KJ_EXPECT(!serverPromise.poll(waitScope));
+  }
+
+  pipe.ends[0]->shutdownWrite();
+  auto text = serverPromise.wait(waitScope);
+  KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    "7\r\npartial\r\n", text);
+}
+
+template <typename Func>
+void expectHttpUploadAbort(Func&& operation, WaitScope& waitScope) {
+  KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+    auto promise = operation();
+    KJ_ASSERT(promise.poll(waitScope), "aborted HTTP body operation is still pending");
+    promise.wait(waitScope);
+  })) {
+    KJ_EXPECT(exception.getType() == kj::Exception::Type::FAILED, exception);
+    KJ_EXPECT(exception.getDescription() == "upload source failed", exception);
+  } else {
+    KJ_FAIL_EXPECT("aborted HTTP body operation succeeded");
+  }
+}
+
+KJ_TEST("HttpClient abortWrite rejects pending and future body writes") {
+  KJ_HTTP_TEST_SETUP_IO;
+
+  for (bool fixedLength: {false, true}) {
+    for (bool gatherWrite: {false, true}) {
+      KJ_CONTEXT(fixedLength, gatherWrite);
+      // Use in-process pipes so the write remains pending until the peer reads it.
+      auto pipe = kj::newTwoWayPipe();
+      HttpHeaderTable table;
+      auto client = newHttpClient(table, *pipe.ends[0]);
+      auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table),
+          fixedLength ? kj::Maybe<uint64_t>(7) : kj::none);
+      ArrayPtr<const byte> pieces[] = {"part"_kjb, "ial"_kjb};
+      auto write = gatherWrite ? req.body->write(arrayPtr(pieces))
+                               : req.body->write("partial"_kjb);
+      KJ_EXPECT(!write.poll(waitScope));
+      expectRead(*pipe.ends[1], fixedLength
+          ? "POST / HTTP/1.1\r\nContent-Length: 7\r\n\r\n"_kj
+          : "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"_kj).wait(waitScope);
+      KJ_EXPECT(!write.poll(waitScope));
+
+      req.body->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+      if (fixedLength && !gatherWrite) {
+        // The rejected promise must also be safe to observe after the writer is destroyed.
+        req.body = nullptr;
+      }
+      expectHttpUploadAbort([&]() { return kj::mv(write); }, waitScope);
+      if (req.body.get() != nullptr) {
+        expectHttpUploadAbort([&]() { return req.body->write("later"_kjb); }, waitScope);
+        expectHttpUploadAbort([&]() { return req.body->write(arrayPtr(pieces)); }, waitScope);
+      }
+      req.body = nullptr;
+      KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
+          client->request(HttpMethod::GET, "/", HttpHeaders(table)));
+    }
+  }
+}
+
+KJ_TEST("HttpClient abortWrite rejects pending and future optimized body pumps") {
+  KJ_HTTP_TEST_SETUP_IO;
+
+  for (bool fixedLength: {false, true}) {
+    KJ_CONTEXT(fixedLength);
+    auto pipe = kj::newTwoWayPipe();
+    auto source = kj::newOneWayPipe(uint64_t(7));
+    HttpHeaderTable table;
+    auto client = newHttpClient(table, *pipe.ends[0]);
+    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table),
+        fixedLength ? kj::Maybe<uint64_t>(7) : kj::none);
+    auto pump = KJ_ASSERT_NONNULL(req.body->tryPumpFrom(*source.in, 7));
+    KJ_EXPECT(!pump.poll(waitScope));
+    expectRead(*pipe.ends[1], fixedLength
+        ? "POST / HTTP/1.1\r\nContent-Length: 7\r\n\r\n"_kj
+        : "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n"_kj).wait(waitScope);
+    KJ_EXPECT(!pump.poll(waitScope));
+
+    req.body->abortWrite(KJ_EXCEPTION(FAILED, "upload source failed"));
+    expectHttpUploadAbort([&]() { return kj::mv(pump); }, waitScope);
+
+    auto laterSource = kj::newOneWayPipe(uint64_t(7));
+    KJ_EXPECT(KJ_ASSERT_NONNULL(req.body->tryPumpFrom(*laterSource.in, 0)).wait(waitScope) == 0);
+    expectHttpUploadAbort([&]() {
+      return KJ_ASSERT_NONNULL(req.body->tryPumpFrom(*laterSource.in, 7));
+    }, waitScope);
+
+    // An unknown-length source must fail at the writer's entry point before falling back to reads.
+    auto unknownLengthSource = kj::newOneWayPipe();
+    expectHttpUploadAbort([&]() {
+      return KJ_ASSERT_NONNULL(req.body->tryPumpFrom(*unknownLengthSource.in, 7));
+    }, waitScope);
+  }
+}
+
+KJ_TEST("HttpClient can abort a chunked body after its source overstates its length") {
+  class OverstatedInput final: public AsyncInputStream {
+  public:
+    Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+      auto amount = kj::min(maxBytes, remaining.size());
+      memcpy(buffer, remaining.begin(), amount);
+      remaining = remaining.slice(amount, remaining.size());
+      return amount;
+    }
+
+    Maybe<uint64_t> tryGetLength() override { return uint64_t(7); }
+
+  private:
+    ArrayPtr<const byte> remaining = "foo"_kjb;
+  } source;
+
+  KJ_HTTP_TEST_SETUP_IO;
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+  auto serverPromise = pipe.ends[1]->readAllText();
+
+  {
+    HttpHeaderTable table;
+    auto client = newHttpClient(table, *pipe.ends[0]);
+    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table));
+    auto pump = KJ_ASSERT_NONNULL(req.body->tryPumpFrom(source));
+    KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() { pump.wait(waitScope); })) {
+      KJ_EXPECT(exception.getDescription().contains(
+          "value returned by input.tryGetLength() was greater than actual bytes transferred"));
+      // The pump already broke the HTTP body. Forwarding that failure must not abort it twice.
+      req.body->abortWrite(exception.clone());
+    } else {
+      KJ_FAIL_EXPECT("source length mismatch was accepted");
+    }
+    req.body = nullptr;
+    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
+        client->request(HttpMethod::GET, "/", HttpHeaders(table)));
+  }
+
+  pipe.ends[0]->shutdownWrite();
+  auto text = serverPromise.wait(waitScope);
+  KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nfoo", text);
+}
+
+KJ_TEST("HttpClient abortWrite after a completed fixed-length body allows reuse") {
+  KJ_HTTP_TEST_SETUP_IO;
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+  auto serverPromise = pipe.ends[1]->readAllText();
+
+  {
+    HttpHeaderTable table;
+    auto client = newHttpClient(table, *pipe.ends[0]);
+    auto req = client->request(HttpMethod::POST, "/", HttpHeaders(table), uint64_t(7));
+    req.body->write("partial"_kjb).wait(waitScope);
+    req.body->abortWrite(KJ_EXCEPTION(FAILED, "too late to abort"));
+    req.body = nullptr;
+
+    auto next = client->request(HttpMethod::POST, "/next", HttpHeaders(table), uint64_t(1));
+    next.body->write("x"_kjb).wait(waitScope);
+  }
+
+  pipe.ends[0]->shutdownWrite();
+  auto text = serverPromise.wait(waitScope);
+  KJ_EXPECT(text == "POST / HTTP/1.1\r\nContent-Length: 7\r\n\r\npartial"
+                    "POST /next HTTP/1.1\r\nContent-Length: 1\r\n\r\nx", text);
+}
+
+class UnexpectedAdapterResponse final: public HttpService::Response {
+public:
+  kj::Own<kj::AsyncOutputStream> send(uint statusCode, kj::StringPtr statusText,
+      const HttpHeaders& headers, kj::Maybe<uint64_t> expectedBodySize) override {
+    KJ_FAIL_ASSERT("unexpected HTTP response");
+  }
+
+  kj::Own<WebSocket> acceptWebSocket(const HttpHeaders& headers) override {
+    KJ_FAIL_ASSERT("unexpected WebSocket response");
+  }
+};
+
+KJ_TEST("HttpService adapter aborts a chunked body when its request is canceled") {
+  KJ_HTTP_TEST_SETUP_IO;
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+  auto serverPromise = pipe.ends[1]->readAllText();
+
+  {
+    HttpHeaderTable table;
+    auto nativeClient = newHttpClient(table, *pipe.ends[0]);
+    auto service = newHttpService(*nativeClient);
+    auto source = kj::newOneWayPipe();
+    UnexpectedAdapterResponse response;
+    {
+      auto request = service->request(
+          HttpMethod::POST, "/", HttpHeaders(table), *source.in, response);
+      source.out->write("partial"_kjb).wait(waitScope);
+      KJ_EXPECT(!request.poll(waitScope));
+      // Dropping the request cancels the pump while it waits for more source bytes.
+    }
+    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
+        nativeClient->request(HttpMethod::GET, "/", HttpHeaders(table)));
+    KJ_EXPECT(!serverPromise.poll(waitScope));
+  }
+
+  pipe.ends[0]->shutdownWrite();
+  auto text = serverPromise.wait(waitScope);
+  KJ_EXPECT(text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    "7\r\npartial\r\n", text);
+}
+
+KJ_TEST("HttpService adapter aborts its body when pumpTo throws synchronously") {
+  class FailingInput final: public AsyncInputStream {
+  public:
+    Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+      KJ_FAIL_ASSERT("unexpected read");
+    }
+
+    Promise<uint64_t> pumpTo(AsyncOutputStream& output, uint64_t amount) override {
+      KJ_FAIL_REQUIRE("upload source failed");
+    }
+  } source;
+
+  KJ_HTTP_TEST_SETUP_IO;
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+  auto serverPromise = pipe.ends[1]->readAllText();
+
+  {
+    HttpHeaderTable table;
+    auto nativeClient = newHttpClient(table, *pipe.ends[0]);
+    auto service = newHttpService(*nativeClient);
+    UnexpectedAdapterResponse response;
+    KJ_EXPECT_THROW_MESSAGE("upload source failed", service->request(
+        HttpMethod::POST, "/", HttpHeaders(table), source, response).wait(waitScope));
+    KJ_EXPECT_THROW_MESSAGE("can't start new request until previous request body",
+        nativeClient->request(HttpMethod::GET, "/", HttpHeaders(table)));
+  }
+
+  pipe.ends[0]->shutdownWrite();
+  auto text = serverPromise.wait(waitScope);
+  // Headers may flush before the synchronous failure is handled; no body or final chunk may follow.
+  KJ_EXPECT(text.size() == 0 ||
+      text == "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", text);
+}
+
 KJ_TEST("HttpClient fixed-length body tryWriteSync") {
   KJ_HTTP_TEST_SETUP_IO;
 

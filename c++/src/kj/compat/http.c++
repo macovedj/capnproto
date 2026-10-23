@@ -2669,8 +2669,34 @@ public:
     }
   }
 
+  void abortWrite(kj::Exception&& exception) override {
+    if (finished) return;
+    abortReason = kj::heap<kj::Exception>(kj::mv(exception));
+    writeCanceler.cancel(*abortReason);
+    KJ_IF_SOME(inner, weakInner) {
+      inner.unsetCurrentWrapper(weakInner);
+      if (inner.isInBody()) inner.abortBody();
+    }
+    // Releasing the wrapper prevents the chunked writer's destructor from emitting a final chunk.
+    finished = true;
+  }
+
 protected:
+  void checkNotAborted() {
+    if (abortReason.get() != nullptr) {
+      kj::throwFatalException(abortReason->clone());
+    }
+  }
+
+  template <typename T>
+  kj::Promise<T> wrapWrite(kj::Promise<T> promise) {
+    // Include continuations that use this writer, so abortWrite() destroys them before releasing
+    // the underlying HTTP stream.
+    return writeCanceler.wrap(kj::mv(promise));
+  }
+
   HttpOutputStream& getInner() {
+    checkNotAborted();
     KJ_IF_SOME(i, weakInner) {
       return i;
     } else if (finished) {
@@ -2693,6 +2719,8 @@ protected:
 private:
   kj::Maybe<HttpOutputStream&> weakInner;
   bool finished = false;
+  kj::Own<kj::Exception> abortReason;
+  kj::Canceler writeCanceler;
 };
 
 class HttpNullEntityWriter final: public kj::AsyncOutputStream {
@@ -2737,7 +2765,16 @@ public:
   }
 
   Promise<void> write(ArrayPtr<const byte> buffer) override {
+    return wrapWrite(writeImpl(buffer));
+  }
+
+  Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+    return wrapWrite(writeImpl(pieces));
+  }
+
+  Promise<void> writeImpl(ArrayPtr<const byte> buffer) {
     if (buffer == nullptr) co_return;
+    checkNotAborted();
     KJ_REQUIRE(buffer.size() <= length, "overwrote Content-Length");
     length -= buffer.size();
 
@@ -2745,11 +2782,12 @@ public:
     if (length == 0) doneWriting();
   }
 
-  Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
+  Promise<void> writeImpl(ArrayPtr<const ArrayPtr<const byte>> pieces) {
     uint64_t size = 0;
     for (auto& piece: pieces) size += piece.size();
 
     if (size == 0) co_return;
+    checkNotAborted();
     KJ_REQUIRE(size <= length, "overwrote Content-Length");
     length -= size;
 
@@ -2785,11 +2823,12 @@ public:
   }
 
   Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
-    return pumpFrom(input, amount);
+    return wrapWrite(pumpFrom(input, amount));
   }
 
   Promise<uint64_t> pumpFrom(AsyncInputStream& input, uint64_t amount) {
     if (amount == 0) co_return 0;
+    checkNotAborted();
 
     bool overshot = amount > length;
     if (overshot) {
@@ -2863,7 +2902,7 @@ public:
     parts[2] = "\r\n"_kjb;
 
     auto promise = getInner().writeBodyData(parts.asPtr());
-    return promise.attach(kj::mv(header), kj::mv(parts));
+    return wrapWrite(kj::mv(promise)).attach(kj::mv(header), kj::mv(parts));
   }
 
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
@@ -2882,7 +2921,7 @@ public:
 
     auto parts = partsBuilder.finish();
     auto promise = getInner().writeBodyData(parts.asPtr());
-    return promise.attach(kj::mv(header), kj::mv(parts));
+    return wrapWrite(kj::mv(promise)).attach(kj::mv(header), kj::mv(parts));
   }
 
   bool tryWriteSync(ArrayPtr<const byte> buffer) override {
@@ -2917,8 +2956,10 @@ public:
   }
 
   Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
+    if (amount == 0) return constPromise<uint64_t, 0>();
+    checkNotAborted();
     KJ_IF_SOME(l, input.tryGetLength()) {
-      return pumpImpl(input, kj::min(amount, l));
+      return wrapWrite(pumpImpl(input, kj::min(amount, l)));
     } else {
       // Need to use naive read/write loop.
       return kj::none;
@@ -7749,6 +7790,38 @@ kj::Own<HttpClient> newHttpClient(HttpService& service) {
 
 namespace {
 
+class HttpRequestBodyPump {
+  // Owns the writer until pumping settles; cancellation aborts it before destruction.
+
+public:
+  explicit HttpRequestBodyPump(kj::Own<kj::AsyncOutputStream> output): output(kj::mv(output)) {}
+
+  ~HttpRequestBodyPump() noexcept(false) {
+    if (!done) {
+      unwind.catchExceptionsIfUnwinding([&]() {
+        output->abortWrite(KJ_EXCEPTION(DISCONNECTED, "HTTP request body transfer was canceled"));
+      });
+    }
+  }
+
+  kj::Promise<void> pumpFrom(kj::AsyncInputStream& input) {
+    return kj::evalNow([this, &input]() { return input.pumpTo(*output); })
+        .then([this](uint64_t) -> kj::Promise<void> {
+      done = true;
+      return kj::READY_NOW;
+    }, [this](kj::Exception&& exception) -> kj::Promise<void> {
+      done = true;
+      output->abortWrite(exception.clone());
+      return kj::mv(exception);
+    });
+  }
+
+private:
+  kj::Own<kj::AsyncOutputStream> output;
+  bool done = false;
+  kj::UnwindDetector unwind;
+};
+
 class HttpServiceAdapter final: public HttpService {
 public:
   HttpServiceAdapter(HttpClient& client): client(client) {}
@@ -7760,8 +7833,9 @@ public:
       auto innerReq = client.request(method, url, headers, requestBody.tryGetLength());
 
       auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
-      promises.add(requestBody.pumpTo(*innerReq.body).ignoreResult()
-          .attach(kj::mv(innerReq.body)).eagerlyEvaluate(nullptr));
+      auto bodyPump = kj::heap<HttpRequestBodyPump>(kj::mv(innerReq.body));
+      promises.add(bodyPump->pumpFrom(requestBody)
+          .attach(kj::mv(bodyPump)).eagerlyEvaluate(nullptr));
 
       promises.add(innerReq.response
           .then([&response](HttpClient::Response&& innerResponse) {
